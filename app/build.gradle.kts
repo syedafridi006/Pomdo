@@ -29,6 +29,7 @@ android {
 }
 dependencies {
     implementation(platform("androidx.compose:compose-bom:2024.06.00"))
+    implementation("androidx.compose.runtime:runtime-saveable")
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.foundation:foundation")
     implementation("androidx.compose.material3:material3")
