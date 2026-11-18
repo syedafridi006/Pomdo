@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="pomdo_bg">#0F2430</color>
+    <style name="Theme.Pomdo" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/pomdo_bg</item>
+        <item name="android:statusBarColor">@color/pomdo_bg</item>
+        <item name="android:navigationBarColor">#173545</item>
+    </style>
+</resources>
