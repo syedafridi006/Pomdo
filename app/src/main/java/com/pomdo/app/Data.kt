@@ -1,48 +1,55 @@
 package com.pomdo.app
 
 import android.app.AlarmManager
-import android.app.Notification
-import android.app.NotificationChannel
-import android.app.NotificationManager
 import android.app.PendingIntent
-import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
-import android.media.Ringtone
-import android.media.RingtoneManager
 import android.os.Build
-import android.os.Handler
-import android.os.Looper
-import android.speech.tts.TextToSpeech
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.Calendar
 
-enum class Category(val label: String, val emoji: String, val color: Long) {
-    WORK("Work", "💼", 0xFFB5793B), STUDY("Study", "📘", 0xFF4A86E8),
-    PERSONAL("Personal", "🌿", 0xFF6BBF59), HEALTH("Health", "❤️", 0xFFE5484D),
-    FITNESS("Fitness", "🏋️", 0xFF7C6FE0), SHOPPING("Shopping", "🛒", 0xFF3AA0E0),
-    HOME("Home", "🏠", 0xFFE8793A), OTHER("Other", "⭐", 0xFFE8B83A)
+enum class Category(val label: String, val color: Long) {
+    WORK("Work", 0xFFE0A15B), STUDY("Study", 0xFF6AA2FF), PERSONAL("Personal", 0xFF7BD26B),
+    HEALTH("Health", 0xFFFF6B6B), FITNESS("Fitness", 0xFFA38CFF), SHOPPING("Shopping", 0xFF4FC3F7),
+    HOME("Home", 0xFFFF9150), OTHER("Other", 0xFFFFD24D)
 }
-enum class Repeat(val label: String) { NONE("Never"), DAILY("Daily"), WEEKLY("Weekly") }
+enum class Repeat(val label: String) { NONE("Never"), DAILY("Daily"), WEEKDAYS("Weekdays"), WEEKLY("Weekly"), MONTHLY("Monthly") }
 enum class SoundMode(val label: String) {
-    VOICE_RINGTONE("Voice + ringtone"), RINGTONE("Ringtone"), VOICE("Voice"), SILENT("Silent")
+    VOICE_NOTIFICATION("Voice + notification"), VOICE_RINGTONE("Voice + ringtone"),
+    RINGTONE("Ringtone"), NOTIFICATION("Notification"), SILENT("Silent")
 }
+fun migrateSound(s: String?) = if (s == "VOICE") "VOICE_NOTIFICATION" else s
 
 data class Task(
     val id: Long, val name: String, val desc: String, val category: Category,
     val start: Long, val due: Long, val reminderMin: Int, val sound: SoundMode,
     val focusMin: Int, val breakMin: Int, val sessions: Int, val priority: Int,
-    val repeat: Repeat, val done: Boolean = false, val completedAt: Long = 0L
+    val repeat: Repeat, val done: Boolean = false, val completedAt: Long = 0L, val spawned: Boolean = false
 )
 data class FocusLog(val time: Long, val minutes: Int, val category: Category)
 
 inline fun <reified T : Enum<T>> parseEnum(s: String?, d: T): T =
     enumValues<T>().firstOrNull { it.name == s } ?: d
+
+fun nextOccurrence(ms: Long, r: Repeat): Long {
+    val c = Calendar.getInstance().apply { timeInMillis = ms }
+    when (r) {
+        Repeat.DAILY -> c.add(Calendar.DAY_OF_YEAR, 1)
+        Repeat.WEEKLY -> c.add(Calendar.DAY_OF_YEAR, 7)
+        Repeat.MONTHLY -> c.add(Calendar.MONTH, 1)
+        Repeat.WEEKDAYS -> do { c.add(Calendar.DAY_OF_YEAR, 1) } while (c.get(Calendar.DAY_OF_WEEK) == Calendar.SATURDAY || c.get(Calendar.DAY_OF_WEEK) == Calendar.SUNDAY)
+        Repeat.NONE -> {}
+    }
+    return c.timeInMillis
+}
+
+fun boot(ctx: Context) { Store.init(ctx); Focus.restore(ctx) }
 
 object Store {
     lateinit var app: Context
@@ -53,16 +60,21 @@ object Store {
     val logs = mutableStateListOf<FocusLog>()
     var defFocus by mutableStateOf(25)
     var defBreak by mutableStateOf(5)
-    var defSound by mutableStateOf(SoundMode.VOICE_RINGTONE)
+    var defLong by mutableStateOf(15)
+    var goal by mutableStateOf(120)
+    var defSound by mutableStateOf(SoundMode.VOICE_NOTIFICATION)
+    var toneUri by mutableStateOf("")
+    var keepAwake by mutableStateOf(false)
 
     fun init(ctx: Context) {
         if (inited) return
         inited = true
         app = ctx.applicationContext
         sp = app.getSharedPreferences("pomdo", Context.MODE_PRIVATE)
-        defFocus = sp.getInt("defFocus", 25)
-        defBreak = sp.getInt("defBreak", 5)
-        defSound = parseEnum(sp.getString("defSound", ""), SoundMode.VOICE_RINGTONE)
+        defFocus = sp.getInt("defFocus", 25); defBreak = sp.getInt("defBreak", 5)
+        defLong = sp.getInt("defLong", 15); goal = sp.getInt("goal", 120)
+        defSound = parseEnum(migrateSound(sp.getString("defSound", "")), SoundMode.VOICE_NOTIFICATION)
+        toneUri = sp.getString("toneUri", "") ?: ""; keepAwake = sp.getBoolean("keepAwake", false)
         try {
             val a = JSONArray(sp.getString("tasks", "[]"))
             for (i in 0 until a.length()) {
@@ -70,18 +82,20 @@ object Store {
                 tasks.add(Task(
                     o.getLong("id"), o.getString("name"), o.optString("desc"),
                     parseEnum(o.optString("cat"), Category.OTHER), o.getLong("start"), o.getLong("due"),
-                    o.optInt("rem", 5), parseEnum(o.optString("snd"), SoundMode.SILENT),
+                    o.optInt("rem", 5), parseEnum(migrateSound(o.optString("snd")), SoundMode.VOICE_NOTIFICATION),
                     o.optInt("fm", 25), o.optInt("bm", 5), o.optInt("ss", 4), o.optInt("pr", 1),
-                    parseEnum(o.optString("rep"), Repeat.NONE), o.optBoolean("done"), o.optLong("doneAt")
+                    parseEnum(o.optString("rep"), Repeat.NONE), o.optBoolean("done"), o.optLong("doneAt"), o.optBoolean("sp")
                 ))
             }
+            val cutoff = System.currentTimeMillis() - 400L * 86400000L
             val l = JSONArray(sp.getString("logs", "[]"))
             for (i in 0 until l.length()) {
                 val o = l.getJSONObject(i)
-                logs.add(FocusLog(o.getLong("t"), o.getInt("m"), parseEnum(o.optString("c"), Category.OTHER)))
+                if (o.getLong("t") >= cutoff) logs.add(FocusLog(o.getLong("t"), o.getInt("m"), parseEnum(o.optString("c"), Category.OTHER)))
             }
         } catch (e: Exception) { }
         lastId = tasks.maxOfOrNull { it.id } ?: 0L
+        rollRecurring()
     }
 
     fun newId(): Long { lastId = maxOf(System.currentTimeMillis(), lastId + 1); return lastId }
@@ -93,16 +107,31 @@ object Store {
                 .put("cat", it.category.name).put("start", it.start).put("due", it.due)
                 .put("rem", it.reminderMin).put("snd", it.sound.name).put("fm", it.focusMin)
                 .put("bm", it.breakMin).put("ss", it.sessions).put("pr", it.priority)
-                .put("rep", it.repeat.name).put("done", it.done).put("doneAt", it.completedAt))
+                .put("rep", it.repeat.name).put("done", it.done).put("doneAt", it.completedAt).put("sp", it.spawned))
         }
         val l = JSONArray()
         logs.forEach { l.put(JSONObject().put("t", it.time).put("m", it.minutes).put("c", it.category.name)) }
-        sp.edit().putString("tasks", a.toString()).putString("logs", l.toString())
-            .putInt("defFocus", defFocus).putInt("defBreak", defBreak)
-            .putString("defSound", defSound.name).apply()
+        sp.edit().putString("tasks", a.toString()).putString("logs", l.toString()).apply()
     }
 
-    fun addTask(t: Task) { tasks.add(t); Reminders.schedule(app, t); save() }
+    fun saveSettings() {
+        sp.edit().putInt("defFocus", defFocus).putInt("defBreak", defBreak).putInt("defLong", defLong)
+            .putInt("goal", goal).putString("defSound", defSound.name).putString("toneUri", toneUri)
+            .putBoolean("keepAwake", keepAwake).apply()
+    }
+
+    fun find(id: Long) = tasks.firstOrNull { it.id == id }
+
+    fun addTask(t: Task) {
+        tasks.add(t); Reminders.schedule(app, t); save()
+        if (t.repeat != Repeat.NONE && t.start - t.reminderMin * 60000L <= System.currentTimeMillis()) spawnNext(t.id)
+    }
+
+    fun update(t: Task) {
+        val i = tasks.indexOfFirst { it.id == t.id }
+        if (i < 0) return
+        Reminders.cancel(app, tasks[i]); tasks[i] = t; Reminders.schedule(app, t); save()
+    }
 
     fun delete(t: Task) { Reminders.cancel(app, t); tasks.removeAll { it.id == t.id }; save() }
 
@@ -113,164 +142,67 @@ object Store {
         val nowDone = !cur.done
         val upd = cur.copy(done = nowDone, completedAt = if (nowDone) System.currentTimeMillis() else 0L)
         tasks[i] = upd
-        if (nowDone) {
-            Reminders.cancel(app, upd)
-            if (upd.repeat != Repeat.NONE) {
-                val step = if (upd.repeat == Repeat.DAILY) 86400000L else 7 * 86400000L
-                addTask(upd.copy(id = newId(), start = upd.start + step, due = upd.due + step,
-                    done = false, completedAt = 0L))
-            }
-        } else Reminders.schedule(app, upd)
+        if (nowDone) { Reminders.cancel(app, upd); save(); spawnNext(upd.id) }
+        else { Reminders.schedule(app, upd); save() }
+    }
+
+    /** Creates the next occurrence of a recurring task exactly once, so the chain never breaks. */
+    fun spawnNext(id: Long) {
+        val i = tasks.indexOfFirst { it.id == id }
+        if (i < 0) return
+        val t = tasks[i]
+        if (t.repeat == Repeat.NONE || t.spawned) return
+        tasks[i] = t.copy(spawned = true)
+        val len = t.due - t.start
+        var s = nextOccurrence(t.start, t.repeat)
+        while (s + len < System.currentTimeMillis()) s = nextOccurrence(s, t.repeat)
+        addTask(t.copy(id = newId(), start = s, due = s + len, done = false, completedAt = 0L, spawned = false))
+    }
+
+    fun rollRecurring() {
+        val now = System.currentTimeMillis()
+        tasks.filter { it.repeat != Repeat.NONE && !it.spawned && it.start <= now }.map { it.id }.forEach { spawnNext(it) }
+    }
+
+    fun applySoundToAll() {
+        for (i in tasks.indices) if (tasks[i].sound != defSound) tasks[i] = tasks[i].copy(sound = defSound)
         save()
     }
 
     fun addLog(l: FocusLog) { logs.add(l); save() }
-    fun saveSettings() = save()
+}
+
+object Alarms {
+    fun set(ctx: Context, at: Long, pi: PendingIntent) {
+        val am = ctx.getSystemService(AlarmManager::class.java)
+        try {
+            if (Build.VERSION.SDK_INT < 31 || am.canScheduleExactAlarms())
+                am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, pi)
+            else am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, pi)
+        } catch (e: SecurityException) {
+            am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, pi)
+        }
+    }
+    fun cancel(ctx: Context, pi: PendingIntent) = ctx.getSystemService(AlarmManager::class.java).cancel(pi)
 }
 
 object Reminders {
-    private fun pi(ctx: Context, t: Task, create: Boolean): PendingIntent? {
-        val i = Intent(ctx, ReminderReceiver::class.java)
-            .putExtra("id", t.id).putExtra("name", t.name).putExtra("min", t.reminderMin)
-            .putExtra("sound", t.sound.name).putExtra("emoji", t.category.emoji)
-        val flags = (if (create) PendingIntent.FLAG_UPDATE_CURRENT else PendingIntent.FLAG_NO_CREATE) or PendingIntent.FLAG_IMMUTABLE
-        return PendingIntent.getBroadcast(ctx, (t.id % Int.MAX_VALUE).toInt(), i, flags)
-    }
+    private fun pi(ctx: Context, id: Long, kind: Int, flags: Int): PendingIntent? =
+        PendingIntent.getBroadcast(ctx, id.hashCode() * 2 + kind,
+            Intent(ctx, ReminderReceiver::class.java).putExtra("id", id), flags or PendingIntent.FLAG_IMMUTABLE)
 
     fun schedule(ctx: Context, t: Task) {
         val at = t.start - t.reminderMin * 60000L
         if (t.done || at <= System.currentTimeMillis()) return
-        val am = ctx.getSystemService(AlarmManager::class.java)
-        val p = pi(ctx, t, true) ?: return
-        try {
-            if (Build.VERSION.SDK_INT < 31 || am.canScheduleExactAlarms())
-                am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, p)
-            else am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, p)
-        } catch (e: SecurityException) {
-            am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, p)
-        }
+        Alarms.set(ctx, at, pi(ctx, t.id, 0, PendingIntent.FLAG_UPDATE_CURRENT) ?: return)
+    }
+
+    fun snooze(ctx: Context, t: Task, min: Int) {
+        Alarms.set(ctx, System.currentTimeMillis() + min * 60000L, pi(ctx, t.id, 1, PendingIntent.FLAG_UPDATE_CURRENT) ?: return)
     }
 
     fun cancel(ctx: Context, t: Task) {
-        val p = pi(ctx, t, false) ?: return
-        ctx.getSystemService(AlarmManager::class.java).cancel(p)
-    }
-}
-
-class BootReceiver : BroadcastReceiver() {
-    override fun onReceive(ctx: Context, i: Intent) {
-        Store.init(ctx)
-        Store.tasks.forEach { Reminders.schedule(ctx, it) }
-    }
-}
-
-class ReminderReceiver : BroadcastReceiver() {
-    override fun onReceive(ctx: Context, i: Intent) {
-        val name = i.getStringExtra("name") ?: "Task"
-        val min = i.getIntExtra("min", 5)
-        val mode = parseEnum(i.getStringExtra("sound"), SoundMode.SILENT)
-        val emoji = i.getStringExtra("emoji") ?: "⏰"
-        val text = if (min == 0) "$name starts now" else "$name starts in $min minutes"
-        val nm = ctx.getSystemService(NotificationManager::class.java)
-        val ch = NotificationChannel("pomdo_rem", "Task reminders", NotificationManager.IMPORTANCE_HIGH)
-        ch.setSound(null, null)
-        nm.createNotificationChannel(ch)
-        val open = PendingIntent.getActivity(ctx, 0, Intent(ctx, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
-        val n = Notification.Builder(ctx, "pomdo_rem")
-            .setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
-            .setContentTitle("$emoji $name").setContentText(text)
-            .setContentIntent(open).setAutoCancel(true).build()
-        nm.notify(i.getLongExtra("id", 0L).toInt(), n)
-
-        val wantTone = mode == SoundMode.RINGTONE || mode == SoundMode.VOICE_RINGTONE
-        val wantVoice = mode == SoundMode.VOICE || mode == SoundMode.VOICE_RINGTONE
-        val pending = goAsync()
-        val h = Handler(Looper.getMainLooper())
-        var rt: Ringtone? = null
-        if (wantTone) {
-            rt = RingtoneManager.getRingtone(ctx, RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE))
-            rt?.play()
-        }
-        h.postDelayed({
-            rt?.stop()
-            if (wantVoice) {
-                var tts: TextToSpeech? = null
-                tts = TextToSpeech(ctx.applicationContext) { st ->
-                    if (st == TextToSpeech.SUCCESS) tts?.speak("Reminder. $text", TextToSpeech.QUEUE_FLUSH, null, "pomdo")
-                }
-                h.postDelayed({ tts?.shutdown(); pending.finish() }, 6000)
-            } else pending.finish()
-        }, if (wantTone) 3000L else 0L)
-    }
-}
-
-object Focus {
-    var task by mutableStateOf<Task?>(null)
-    var focusing by mutableStateOf(true)
-    var running by mutableStateOf(false)
-    var active by mutableStateOf(false)
-    var finished by mutableStateOf(false)
-    var remaining by mutableStateOf(25 * 60)
-    var session by mutableStateOf(1)
-    var totalSessions by mutableStateOf(4)
-    var focusedSec by mutableStateOf(0)
-    var focusMin = 25
-    var breakMin = 5
-    private var unlogged = 0
-    private val handler = Handler(Looper.getMainLooper())
-    private val tick = object : Runnable {
-        override fun run() {
-            if (!running) return
-            remaining--
-            if (focusing) { focusedSec++; unlogged++ }
-            if (remaining <= 0) phaseDone() else handler.postDelayed(this, 1000)
-        }
-    }
-
-    private fun cat() = task?.category ?: Category.OTHER
-
-    private fun beep() {
-        try { RingtoneManager.getRingtone(Store.app, RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)).play() } catch (e: Exception) { }
-    }
-
-    private fun flush() {
-        if (unlogged >= 60) Store.addLog(FocusLog(System.currentTimeMillis(), unlogged / 60, cat()))
-        unlogged = 0
-    }
-
-    private fun phaseDone() {
-        beep()
-        if (focusing) {
-            flush()
-            if (session >= totalSessions) { running = false; finished = true; active = false; remaining = 0; return }
-            focusing = false; remaining = breakMin * 60
-        } else {
-            session++; focusing = true; remaining = focusMin * 60
-        }
-        handler.postDelayed(tick, 1000)
-    }
-
-    fun start(t: Task?) {
-        handler.removeCallbacks(tick)
-        task = t
-        focusMin = t?.focusMin ?: Store.defFocus
-        breakMin = t?.breakMin ?: Store.defBreak
-        totalSessions = t?.sessions ?: 4
-        session = 1; focusing = true; remaining = focusMin * 60
-        unlogged = 0; focusedSec = 0; finished = false; active = true; running = true
-        handler.postDelayed(tick, 1000)
-    }
-
-    fun toggle() {
-        handler.removeCallbacks(tick)
-        running = !running
-        if (running) handler.postDelayed(tick, 1000)
-    }
-
-    fun finish() {
-        handler.removeCallbacks(tick)
-        flush()
-        running = false; active = false; finished = true
-        task?.let { t -> Store.tasks.firstOrNull { it.id == t.id }?.let { if (!it.done) Store.toggle(it) } }
+        pi(ctx, t.id, 0, PendingIntent.FLAG_NO_CREATE)?.let { Alarms.cancel(ctx, it) }
+        pi(ctx, t.id, 1, PendingIntent.FLAG_NO_CREATE)?.let { Alarms.cancel(ctx, it) }
     }
 }
